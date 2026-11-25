@@ -16,31 +16,26 @@ def _field(obj, name, default=None):
     return getattr(obj, name, default)
 
 
-def _available_stock(part):
-    """Use InvenTree's unallocated availability where exposed.
+def _locations():
+    from stock.models import StockLocation
+    return list(StockLocation.objects.values('id', 'name', 'parent_id').order_by('name'))
 
-    Do not count stock that is otherwise unusable as a purchasing offset.
-    """
+
+def _available_stock(part, excluded):
     from stock.models import StockItem
-    from django.db.models import Sum, F
-    # Core availability intentionally uses the available_stock property which
-    # accounts for existing allocations; status is screened independently.
-    total = 0
+    totals = dict(physical=0, excluded=0, allocated=0, available=0)
     for item in StockItem.objects.filter(part=part).iterator():
-        if _field(item, 'belongs_to_id') or _field(item, 'consumed_by_id'):
+        qty = max(0, float(item.quantity))
+        totals['physical'] += qty
+        if item.location_id in excluded or item.belongs_to_id or item.consumed_by_id:
+            totals['excluded'] += qty
             continue
-        # Only usable statuses. This intentionally excludes rework, quarantine,
-        # failed, returned, damaged, lost, and in-transit stock.
-        if int(_field(item, 'status', -1)) != 10:
-            continue
-        if _field(item, 'status_custom_key') is not None:
-            continue
-        amount = _field(item, 'available_stock', None)
-        if amount is None:
-            allocated = _field(item, 'allocated', 0)
-            amount = max(0, float(item.quantity) - float(allocated or 0))
-        total += max(0, float(amount))
-    return total
+        # InvenTree's stock allocation method includes build and sales allocations.
+        allocated = item.allocation_count()
+        allocated = min(qty, max(0, float(allocated or 0)))
+        totals['allocated'] += allocated
+        totals['available'] += qty - allocated
+    return totals
 
 
 def _price(part, usd_rate):
@@ -52,7 +47,7 @@ def _price(part, usd_rate):
     try:
         lines = PurchaseOrderLineItem.objects.filter(part__part=part, order__status=30).select_related(
             'order', 'part'
-        ).order_by('-pk')[:100]
+        ).order_by('-order__complete_date', '-pk')
         for line in lines:
             order = line.order
             # Explicitly only count orders marked complete (InvenTree status 30).
@@ -88,9 +83,10 @@ def _price(part, usd_rate):
     return None
 
 
-def _snapshot(root, usd_rate):
+def _snapshot(root, usd_rate, excluded, overrides):
     """Load reachable BOM graph and inventory once per analysis request."""
     bom, stock, prices, labels, warnings = {}, {}, {}, {}, []
+    inventory = {}
     visited = set()
     queue = [root]
     while queue and len(visited) < 10000:
@@ -99,8 +95,9 @@ def _snapshot(root, usd_rate):
             continue
         visited.add(part.pk)
         labels[part.pk] = {'name': part.name, 'ipn': part.IPN or '', 'pk': part.pk}
-        stock[part.pk] = _available_stock(part)
-        quote = _price(part, usd_rate)
+        inventory[part.pk] = _available_stock(part, excluded)
+        stock[part.pk] = inventory[part.pk]['available']
+        quote = (overrides[part.pk], 'Manual CAD override') if part.pk in overrides else _price(part, usd_rate)
         if quote:
             prices[part.pk] = quote
         bom[part.pk] = []
@@ -119,7 +116,7 @@ def _snapshot(root, usd_rate):
             warnings.append(f'Assembly {part.pk} has no BOM; treated as purchasable')
     if queue:
         warnings.append('10,000-part traversal limit reached')
-    return bom, stock, prices, labels, warnings
+    return bom, stock, prices, labels, warnings, inventory
 
 
 class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePlugin):
@@ -127,7 +124,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.1.3'
+    VERSION = '0.1.4'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -145,8 +142,8 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             'title': 'Production Cost Optimizer',
             'description': 'Recursive BOM purchasing scenarios',
             'icon': 'ti:calculator:outline',
-            'source': self.plugin_static_file('optimizer_v013.js:renderOptimizer'),
-            'context': {'part_id': part.pk, 'part_name': part.name, 'part_ipn': part.IPN or ''},
+            'source': self.plugin_static_file('optimizer_v014.js:renderOptimizer'),
+            'context': {'part_id': part.pk, 'part_name': part.name, 'part_ipn': part.IPN or '', 'locations': _locations()},
         }]
 
     def perform_action(self, user=None, data=None):
@@ -166,7 +163,27 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             root = Part.objects.get(pk=part_id)
         except Part.DoesNotExist as exc:
             raise ValidationError('Part does not exist') from exc
-        bom, stock, prices, labels, warnings = _snapshot(root, usd_rate)
+        try:
+            excluded = {int(x) for x in data.get('excluded_locations', [])}
+            overrides = {int(k): float(v) for k, v in data.get('overrides', {}).items()}
+            if any(not math.isfinite(v) or v < 0 for v in overrides.values()):
+                raise ValueError('Invalid override')
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValidationError('Invalid location or price override') from exc
+        if data.get('exclude_children', True):
+            locations = _locations()
+            while True:
+                expanded = excluded | {x['id'] for x in locations if x['parent_id'] in excluded}
+                if expanded == excluded:
+                    break
+                excluded = expanded
+        bom, stock, prices, labels, warnings, inventory = _snapshot(root, usd_rate, excluded, overrides)
+        names = [x['name'].upper() + ' ' + x['ipn'].upper() for x in labels.values()]
+        for suffix, label in [('-BARE', 'PCB fabrication'), ('-ASM', 'PCB assembly')]:
+            if not any(suffix in name for name in names):
+                warnings.append(f'{label} costs excluded: no {suffix} parts in BOM')
+        if any('MECH' in labels[k]['name'].upper() and not bom[k] and k not in prices for k in labels):
+            warnings.append('Mechanical costs excluded: unpriced mechanical assembly without BOM')
         scenarios = [plan(root.pk, qty, bom, stock, prices)
                      for qty in range(minimum, maximum + 1)]
         # Incremental spend and marginal increase; incomplete prices remain marked.
@@ -174,17 +191,19 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
         for scenario in scenarios:
             scenario['incremental_next_unit_cad'] = (
                 scenario['known_spend_cad'] - previous['known_spend_cad']
-                if previous is not None and previous['complete'] and scenario['complete'] else None
+                if previous is not None else None
             )
             scenario['complete'] = scenario['complete'] and not any('traversal limit' in w for w in warnings)
             scenario['warnings'].extend(warnings)
             for line in scenario['purchase_lines']:
                 line['part'] = labels.get(line['part_id'], {'pk': line['part_id']})
+                line.update(inventory[line['part_id']])
+                line['required'] = line['shortage'] + scenario['stock_consumed'].get(line['part_id'], 0)
             previous = scenario
         self._last_result = {'part': labels[root.pk], 'currency': 'CAD', 'usd_rate': usd_rate,
-                             'scenarios': scenarios, 'read_only': True,
+                             'scenarios': scenarios, 'read_only': True, 'excluded_locations': sorted(excluded), 'exclude_children': data.get('exclude_children', True), 'overrides': overrides,
                              'limitations': [
-                                 'Only unallocated normal-status stock is considered',
+                                 'Estimation only: all stock statuses assumed usable; existing allocations deducted; selected locations excluded',
                                  'Optional BOM lines and substitutes are not automatically selected',
                                  'Supplier MOQs, package multiples and currencies other than CAD/USD are not yet modeled',
                                  'Reported spend is a lower bound when pricing is incomplete',
