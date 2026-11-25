@@ -124,7 +124,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.1.4'
+    VERSION = '0.1.5'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -142,7 +142,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             'title': 'Production Cost Optimizer',
             'description': 'Recursive BOM purchasing scenarios',
             'icon': 'ti:calculator:outline',
-            'source': self.plugin_static_file('optimizer_v014.js:renderOptimizer'),
+            'source': self.plugin_static_file('optimizer_v015.js:renderOptimizer'),
             'context': {'part_id': part.pk, 'part_name': part.name, 'part_ipn': part.IPN or '', 'locations': _locations()},
         }]
 
