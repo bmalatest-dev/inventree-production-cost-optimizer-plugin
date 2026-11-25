@@ -48,8 +48,8 @@ def _price(part):
     """
     from order.models import PurchaseOrderLineItem
     try:
-        lines = PurchaseOrderLineItem.objects.filter(supplier_part__part=part).select_related(
-            'order', 'supplier_part'
+        lines = PurchaseOrderLineItem.objects.filter(part__part=part).select_related(
+            'order', 'part'
         ).order_by('-pk')[:100]
         for line in lines:
             order = line.order
@@ -60,7 +60,7 @@ def _price(part):
             if price is None or float(price) <= 0:
                 continue
             currency = str(_field(line, 'purchase_price_currency', 'CAD'))
-            pack = float(_field(line.supplier_part, 'pack_quantity', 1) or 1)
+            pack = float(_field(line.part, 'pack_quantity', 1) or 1)
             if currency == 'CAD' and pack > 0:
                 return (float(price) / pack, f'Completed PO {order.reference}')
     except (AttributeError, ValueError, TypeError):
@@ -125,7 +125,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.1.1'
+    VERSION = '0.1.2'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
