@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from django.core.exceptions import ValidationError
 from part.models import Part, BomItem
 from plugin import InvenTreePlugin
@@ -41,14 +43,14 @@ def _available_stock(part):
     return total
 
 
-def _price(part):
-    """CAD only: historical completed order price then supplier price fallback.
+def _price(part, usd_rate):
+    """Historical completed order price then supplier price fallback.
 
-    No implicit FX conversion: other currencies are flagged as unpriced.
+    USD is converted using the scenario rate; other currencies remain unpriced.
     """
     from order.models import PurchaseOrderLineItem
     try:
-        lines = PurchaseOrderLineItem.objects.filter(part__part=part).select_related(
+        lines = PurchaseOrderLineItem.objects.filter(part__part=part, order__status=30).select_related(
             'order', 'part'
         ).order_by('-pk')[:100]
         for line in lines:
@@ -57,12 +59,12 @@ def _price(part):
             if int(order.status) != 30:
                 continue
             price = _field(line, 'purchase_price', None)
-            if price is None or float(price) <= 0:
+            if price is None or float(getattr(price, 'amount', price)) <= 0:
                 continue
             currency = str(_field(line, 'purchase_price_currency', 'CAD'))
             pack = float(_field(line.part, 'pack_quantity', 1) or 1)
-            if currency == 'CAD' and pack > 0:
-                return (float(price) / pack, f'Completed PO {order.reference}')
+            if currency in ('CAD', 'USD') and pack > 0:
+                return (float(getattr(price, 'amount', price)) / pack * (usd_rate if currency == 'USD' else 1), f'Completed PO {order.reference}: {price} {currency} / pack {pack:g}')
     except (AttributeError, ValueError, TypeError):
         pass
 
@@ -77,16 +79,16 @@ def _price(part):
             for price_break in supplier.price_breaks.all():
                 price = _field(price_break, 'price', None)
                 currency = str(_field(price_break, 'price_currency', 'CAD'))
-                if price is not None and float(price) > 0 and currency == 'CAD':
-                    offers.append(float(price) / pack)
+                if price is not None and float(getattr(price, 'amount', price)) > 0 and currency in ('CAD', 'USD'):
+                    offers.append((float(getattr(price, 'amount', price)) / pack * (usd_rate if currency == 'USD' else 1), f'Supplier price break: {price} {currency} / pack {pack:g} (indicative)'))
         if offers:
-            return min(offers), 'Supplier price break (indicative; MOQ not modeled)'
+            return min(offers)
     except (AttributeError, TypeError, ValueError):
         pass
     return None
 
 
-def _snapshot(root):
+def _snapshot(root, usd_rate):
     """Load reachable BOM graph and inventory once per analysis request."""
     bom, stock, prices, labels, warnings = {}, {}, {}, {}, []
     visited = set()
@@ -98,7 +100,7 @@ def _snapshot(root):
         visited.add(part.pk)
         labels[part.pk] = {'name': part.name, 'ipn': part.IPN or '', 'pk': part.pk}
         stock[part.pk] = _available_stock(part)
-        quote = _price(part)
+        quote = _price(part, usd_rate)
         if quote:
             prices[part.pk] = quote
         bom[part.pk] = []
@@ -125,7 +127,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.1.2'
+    VERSION = '0.1.3'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -143,7 +145,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             'title': 'Production Cost Optimizer',
             'description': 'Recursive BOM purchasing scenarios',
             'icon': 'ti:calculator:outline',
-            'source': self.plugin_static_file('optimizer.js:renderOptimizer'),
+            'source': self.plugin_static_file('optimizer_v013.js:renderOptimizer'),
             'context': {'part_id': part.pk, 'part_name': part.name, 'part_ipn': part.IPN or ''},
         }]
 
@@ -153,15 +155,18 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             part_id = int(data.get('part'))
             minimum = int(data.get('minimum', 1))
             maximum = int(data.get('maximum', minimum * 2))
+            usd_rate = float(data.get('usd_rate', 1.40))
         except (TypeError, ValueError) as exc:
             raise ValidationError('Part and build quantities must be integers') from exc
+        if not math.isfinite(usd_rate) or usd_rate <= 0:
+            raise ValidationError('USD to CAD rate must be positive')
         if not (1 <= minimum <= maximum <= 200):
             raise ValidationError('Specify a range of 1–200 units, minimum <= maximum')
         try:
             root = Part.objects.get(pk=part_id)
         except Part.DoesNotExist as exc:
             raise ValidationError('Part does not exist') from exc
-        bom, stock, prices, labels, warnings = _snapshot(root)
+        bom, stock, prices, labels, warnings = _snapshot(root, usd_rate)
         scenarios = [plan(root.pk, qty, bom, stock, prices)
                      for qty in range(minimum, maximum + 1)]
         # Incremental spend and marginal increase; incomplete prices remain marked.
@@ -171,17 +176,17 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                 scenario['known_spend_cad'] - previous['known_spend_cad']
                 if previous is not None and previous['complete'] and scenario['complete'] else None
             )
-            scenario['complete'] = scenario['complete'] and not warnings
+            scenario['complete'] = scenario['complete'] and not any('traversal limit' in w for w in warnings)
             scenario['warnings'].extend(warnings)
             for line in scenario['purchase_lines']:
                 line['part'] = labels.get(line['part_id'], {'pk': line['part_id']})
             previous = scenario
-        self._last_result = {'part': labels[root.pk], 'currency': 'CAD',
+        self._last_result = {'part': labels[root.pk], 'currency': 'CAD', 'usd_rate': usd_rate,
                              'scenarios': scenarios, 'read_only': True,
                              'limitations': [
                                  'Only unallocated normal-status stock is considered',
                                  'Optional BOM lines and substitutes are not automatically selected',
-                                 'Supplier MOQs, package multiples and FX conversion are not yet modeled',
+                                 'Supplier MOQs, package multiples and currencies other than CAD/USD are not yet modeled',
                                  'Reported spend is a lower bound when pricing is incomplete',
                              ]}
 
