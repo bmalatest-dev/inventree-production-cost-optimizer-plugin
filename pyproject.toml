@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inventree-production-cost-optimizer"
+version = "0.1.0"
+description = "Read-only recursive BOM production quantity and purchasing cost planning for InvenTree."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Per Vices Corporation"}]
+
+[project.entry-points."inventree_plugins"]
+ProductionCostOptimizerPlugin = "inventree_production_cost_optimizer.plugin:ProductionCostOptimizerPlugin"
+
+[tool.setuptools.packages.find]
+include = ["inventree_production_cost_optimizer*"]
+
+[tool.setuptools.package-data]
+inventree_production_cost_optimizer = ["static/*.js"]
