@@ -143,7 +143,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.2.1'
+    VERSION = '0.2.2'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -161,7 +161,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             'title': 'Production Cost Optimizer',
             'description': 'Recursive BOM purchasing scenarios',
             'icon': 'ti:calculator:outline',
-            'source': self.plugin_static_file('optimizer_v021.js:renderOptimizer'),
+            'source': self.plugin_static_file('optimizer_v022.js:renderOptimizer'),
             'context': {'part_id': part.pk, 'part_name': part.name, 'part_ipn': part.IPN or '', 'locations': _locations()},
         }]
 
@@ -203,8 +203,8 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                 warnings.append(f'{label} costs excluded: no {suffix} parts in BOM')
         if any('MECH' in labels[k]['name'].upper() and not bom[k] and k not in prices for k in labels):
             warnings.append('Mechanical costs excluded: unpriced mechanical assembly without BOM')
-        settings = {'spillage': bool(data.get('spillage', True)), 'single_package': bool(data.get('single_package', True)), 'include_incoming': bool(data.get('include_incoming', False))}
-        scenarios = [plan(root.pk, qty, bom, stock, prices, policies, {k: v['packages'] for k,v in inventory.items()}, incoming if settings['include_incoming'] else {}, settings['spillage'], settings['single_package'])
+        settings = {'spillage': bool(data.get('spillage', True)), 'single_package': bool(data.get('single_package', True)), 'include_incoming': bool(data.get('include_incoming', False)), 'use_subassemblies': bool(data.get('use_subassemblies', True))}
+        scenarios = [plan(root.pk, qty, bom, stock, prices, policies, {k: v['packages'] for k,v in inventory.items()}, incoming if settings['include_incoming'] else {}, settings['spillage'], settings['single_package'], settings['use_subassemblies'])
                      for qty in range(minimum, maximum + 1)]
         # Incremental spend and marginal increase; incomplete prices remain marked.
         previous = None
@@ -215,6 +215,8 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             )
             scenario['complete'] = scenario['complete'] and not any('traversal limit' in w for w in warnings)
             scenario['warnings'].extend(warnings)
+            for line in scenario['subassemblies']:
+                line['part'] = labels[line['part_id']]
             for line in scenario['purchase_lines']:
                 line['part'] = labels.get(line['part_id'], {'pk': line['part_id']})
                 line.update({k:v for k,v in inventory[line['part_id']].items() if k != 'packages'})
