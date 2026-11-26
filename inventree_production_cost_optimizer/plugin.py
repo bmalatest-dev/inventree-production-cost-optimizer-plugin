@@ -44,28 +44,29 @@ def _available_stock(part, excluded):
     return totals
 
 
-def _price(part, usd_rate):
-    """Historical completed order price then supplier price fallback.
+def _price(part, usd_rate, selected=None):
+    """Placed/completed PO, cancelled PO, then supplier price fallback.
 
     USD is converted using the scenario rate; other currencies remain unpriced.
     """
     from order.models import PurchaseOrderLineItem
     try:
-        lines = PurchaseOrderLineItem.objects.filter(part__part=part, order__status=30).select_related(
+        from django.db.models import Case, When, Value, IntegerField
+        lines = PurchaseOrderLineItem.objects.filter(part__part=part, order__status__in=[20, 30, 40]).select_related(
             'order', 'part'
-        ).order_by('-order__complete_date', '-pk')
+        ).annotate(priority=Case(When(order__status=40, then=Value(1)), default=Value(0), output_field=IntegerField())).order_by('priority', '-order__creation_date', '-pk')
         for line in lines:
             order = line.order
-            # Explicitly only count orders marked complete (InvenTree status 30).
-            if int(order.status) != 30:
-                continue
             price = _field(line, 'purchase_price', None)
             if price is None or float(getattr(price, 'amount', price)) <= 0:
                 continue
             currency = str(_field(line, 'purchase_price_currency', 'CAD'))
             pack = float(_field(line.part, 'pack_quantity', 1) or 1)
             if currency in ('CAD', 'USD') and pack > 0:
-                return (float(getattr(price, 'amount', price)) / pack * (usd_rate if currency == 'USD' else 1), f'Completed PO {order.reference}: {price} {currency} / pack {pack:g}')
+                if selected is not None:
+                    selected[part.pk] = order.pk
+                status = {20: 'Placed', 30: 'Completed', 40: 'Cancelled cost reference'}[int(order.status)]
+                return (float(getattr(price, 'amount', price)) / pack * (usd_rate if currency == 'USD' else 1), f'{status} PO {order.reference}: {price} {currency} / pack {pack:g}')
     except (AttributeError, ValueError, TypeError):
         pass
 
@@ -92,7 +93,7 @@ def _price(part, usd_rate):
 def _snapshot(root, usd_rate, excluded, overrides):
     """Load reachable BOM graph and inventory once per analysis request."""
     bom, stock, prices, labels, warnings = {}, {}, {}, {}, []
-    inventory, policies, incoming = {}, {}, {}
+    inventory, policies, incoming, selected = {}, {}, {}, {}
     visited = set()
     queue = [root]
     while queue and len(visited) < 10000:
@@ -103,7 +104,9 @@ def _snapshot(root, usd_rate, excluded, overrides):
         labels[part.pk] = {'name': part.name, 'ipn': part.IPN or '', 'pk': part.pk}
         inventory[part.pk] = _available_stock(part, excluded)
         stock[part.pk] = inventory[part.pk]['available']
-        quote = (overrides[part.pk], 'Manual CAD override') if part.pk in overrides else _price(part, usd_rate)
+        quote = _price(part, usd_rate, selected)
+        if part.pk in overrides:
+            quote = (overrides[part.pk], 'Manual CAD override')
         if quote:
             prices[part.pk] = quote
         params = {}
@@ -135,7 +138,37 @@ def _snapshot(root, usd_rate, excluded, overrides):
             warnings.append(f'Assembly {part.name} (ID {part.pk}) has no BOM; treated as purchasable')
     if queue:
         warnings.append('10,000-part traversal limit reached')
-    return bom, stock, prices, labels, warnings, inventory, policies, incoming
+    return bom, stock, prices, labels, warnings, inventory, policies, incoming, selected
+
+
+def _manufacturing(part):
+    return any(str(x or '').upper().endswith(('-BARE', '-ASM')) for x in (part.name, part.IPN))
+
+
+def _nre_candidates(selected, labels, usd_rate):
+    from order.models import PurchaseOrderLineItem, PurchaseOrder
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for part_id, order_id in selected.items():
+        label = labels[part_id]
+        if any(str(label[k]).upper().endswith(('-BARE', '-ASM')) for k in ('name', 'ipn')):
+            groups[order_id].append(part_id)
+    rows = []
+    for order_id, parts in groups.items():
+        order = PurchaseOrder.objects.get(pk=order_id)
+        for line in PurchaseOrderLineItem.objects.filter(order_id=order_id).select_related('part__part'):
+            if line.part_id and _manufacturing(line.part.part):
+                continue
+            price = line.purchase_price
+            currency = str(getattr(line, 'purchase_price_currency', ''))
+            cost = float(getattr(price, 'amount', price)) * float(line.quantity) * (usd_rate if currency == 'USD' else 1) if price is not None and currency in ('CAD', 'USD') else None
+            rows.append(dict(id='line:' + str(line.pk), order_id=order_id, po=order.reference, description=str(line.part.part.name if line.part_id else getattr(line, 'reference', 'Additional line')), part_ids=parts, cost=cost))
+        for line in order.extra_lines.all():
+            price = line.price
+            currency = str(getattr(line, 'price_currency', ''))
+            cost = float(getattr(price, 'amount', price)) * float(line.quantity) * (usd_rate if currency == 'USD' else 1) if price is not None and currency in ('CAD', 'USD') else None
+            rows.append(dict(id='extra:' + str(line.pk), order_id=order_id, po=order.reference, description=str(getattr(line, 'description', '') or getattr(line, 'reference', '') or 'Extra charge'), part_ids=parts, cost=cost))
+    return rows
 
 
 class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePlugin):
@@ -143,7 +176,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.2.3'
+    VERSION = '0.3.0'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -161,7 +194,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             'title': 'Production Cost Optimizer',
             'description': 'Recursive BOM purchasing scenarios',
             'icon': 'ti:calculator:outline',
-            'source': self.plugin_static_file('optimizer_v022.js:renderOptimizer'),
+            'source': self.plugin_static_file('optimizer_v030.js:renderOptimizer'),
             'context': {'part_id': part.pk, 'part_name': part.name, 'part_ipn': part.IPN or '', 'locations': _locations()},
         }]
 
@@ -196,19 +229,46 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                 if expanded == excluded:
                     break
                 excluded = expanded
-        bom, stock, prices, labels, warnings, inventory, policies, incoming = _snapshot(root, usd_rate, excluded, overrides)
+        bom, stock, prices, labels, warnings, inventory, policies, incoming, selected = _snapshot(root, usd_rate, excluded, overrides)
         names = [x['name'].upper() + ' ' + x['ipn'].upper() for x in labels.values()]
         for suffix, label in [('-BARE', 'PCB fabrication'), ('-ASM', 'PCB assembly')]:
             if not any(suffix in name for name in names):
                 warnings.append(f'{label} costs excluded: no {suffix} parts in BOM')
         if any('MECH' in labels[k]['name'].upper() and not bom[k] and k not in prices for k in labels):
             warnings.append('Mechanical costs excluded: unpriced mechanical assembly without BOM')
-        settings = {'spillage': bool(data.get('spillage', True)), 'single_package': bool(data.get('single_package', True)), 'include_incoming': bool(data.get('include_incoming', False)), 'use_subassemblies': bool(data.get('use_subassemblies', True))}
+        settings = {'spillage': bool(data.get('spillage', True)), 'single_package': bool(data.get('single_package', True)), 'include_incoming': bool(data.get('include_incoming', False)), 'use_subassemblies': bool(data.get('use_subassemblies', True)), 'include_nre': bool(data.get('include_nre', True))}
         scenarios = [plan(root.pk, qty, bom, stock, prices, policies, {k: v['packages'] for k,v in inventory.items()}, incoming if settings['include_incoming'] else {}, settings['spillage'], settings['single_package'], settings['use_subassemblies'])
                      for qty in range(minimum, maximum + 1)]
+        candidates = _nre_candidates(selected, labels, usd_rate)
+        try:
+            edits = data.get('nre_edits', {})
+            for row in candidates:
+                edit = edits.get(row['id'], {})
+                row['included'] = bool(edit.get('included', True))
+                if edit.get('cost') is not None:
+                    row['cost'] = float(edit['cost'])
+                if row['cost'] is not None and (not math.isfinite(row['cost']) or row['cost'] < 0):
+                    raise ValueError('Invalid NRE cost')
+            for i, row in enumerate(data.get('manual_nre', [])):
+                part_id = int(row['part_id'])
+                cost = float(row['cost'])
+                if part_id not in labels or not math.isfinite(cost) or cost < 0:
+                    raise ValueError('Invalid manual NRE')
+                candidates.append(dict(id='manual:' + str(i), po='Manual', description=str(row['description']), part_ids=[part_id], cost=cost, included=True))
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise ValidationError('Invalid NRE settings') from exc
         # Incremental spend and marginal increase; incomplete prices remain marked.
         previous = None
         for scenario in scenarios:
+            shortages = {p['part_id'] for p in scenario['purchase_lines'] if p['shortage'] > 0}
+            scenario['recurring_spend_cad'] = scenario['known_spend_cad']
+            scenario['nre_lines'] = [r for r in candidates if settings['include_nre'] and r['included'] and shortages.intersection(r['part_ids'])]
+            scenario['nre_spend_cad'] = sum(r['cost'] for r in scenario['nre_lines'] if r['cost'] is not None)
+            if any(r['cost'] is None for r in scenario['nre_lines']):
+                scenario['complete'] = False
+                scenario['warnings'].append('One or more applicable NRE charges are unpriced')
+            scenario['known_spend_cad'] += scenario['nre_spend_cad']
+            scenario['known_spend_per_unit_cad'] = scenario['known_spend_cad'] / scenario['quantity']
             scenario['incremental_next_unit_cad'] = (
                 scenario['known_spend_cad'] - previous['known_spend_cad']
                 if previous is not None else None
@@ -222,7 +282,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                 line.update({k:v for k,v in inventory[line['part_id']].items() if k != 'packages'})
             previous = scenario
         self._last_result = {'part': labels[root.pk], 'currency': 'CAD', 'usd_rate': usd_rate,
-                             'scenarios': scenarios, 'read_only': True, 'excluded_locations': sorted(excluded), 'exclude_children': data.get('exclude_children', True), 'overrides': overrides, 'settings': settings,
+                             'scenarios': scenarios, 'read_only': True, 'excluded_locations': sorted(excluded), 'exclude_children': data.get('exclude_children', True), 'overrides': overrides, 'settings': settings, 'nre_candidates': candidates,
                              'limitations': [
                                  'Estimation only: all stock statuses assumed usable; existing allocations deducted; selected locations excluded',
                                  'Optional BOM lines and substitutes are not automatically selected',
