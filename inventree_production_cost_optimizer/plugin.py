@@ -176,7 +176,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.3.0'
+    VERSION = '0.3.1'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -241,7 +241,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                      for qty in range(minimum, maximum + 1)]
         candidates = _nre_candidates(selected, labels, usd_rate)
         try:
-            edits = data.get('nre_edits', {})
+            edits = data.get('nre_edits') or {}
             for row in candidates:
                 edit = edits.get(row['id'], {})
                 row['included'] = bool(edit.get('included', True))
@@ -249,14 +249,14 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                     row['cost'] = float(edit['cost'])
                 if row['cost'] is not None and (not math.isfinite(row['cost']) or row['cost'] < 0):
                     raise ValueError('Invalid NRE cost')
-            for i, row in enumerate(data.get('manual_nre', [])):
+            for i, row in enumerate(data.get('manual_nre') or []):
                 part_id = int(row['part_id'])
                 cost = float(row['cost'])
                 if part_id not in labels or not math.isfinite(cost) or cost < 0:
                     raise ValueError('Invalid manual NRE')
                 candidates.append(dict(id='manual:' + str(i), po='Manual', description=str(row['description']), part_ids=[part_id], cost=cost, included=True))
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
-            raise ValidationError('Invalid NRE settings') from exc
+            raise ValidationError(f'Invalid NRE settings: {type(exc).__name__}: {exc}') from exc
         # Incremental spend and marginal increase; incomplete prices remain marked.
         previous = None
         for scenario in scenarios:
