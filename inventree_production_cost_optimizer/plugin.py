@@ -176,7 +176,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.3.1'
+    VERSION = '0.3.2'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -247,8 +247,8 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                 row['included'] = bool(edit.get('included', True))
                 if edit.get('cost') is not None:
                     row['cost'] = float(edit['cost'])
-                if row['cost'] is not None and (not math.isfinite(row['cost']) or row['cost'] < 0):
-                    raise ValueError('Invalid NRE cost')
+                if row['cost'] is not None and not math.isfinite(row['cost']):
+                    raise ValueError(f"Invalid NRE cost for {row['po']} / {row['description']}: {row['cost']}")
             for i, row in enumerate(data.get('manual_nre') or []):
                 part_id = int(row['part_id'])
                 cost = float(row['cost'])
