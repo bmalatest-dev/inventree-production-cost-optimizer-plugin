@@ -10,6 +10,7 @@ from plugin import InvenTreePlugin
 from plugin.mixins import ActionMixin, UserInterfaceMixin
 
 from .engine import plan
+from .policy import spillage_per_project, is_basic_passive_identity, normalize_footprint, PASSIVE_FOOTPRINT_SPILLAGE
 
 
 def _field(obj, name, default=None):
@@ -23,7 +24,7 @@ def _locations():
 
 def _available_stock(part, excluded):
     from stock.models import StockItem
-    totals = dict(physical=0, excluded=0, allocated=0, available=0)
+    totals = dict(physical=0, excluded=0, allocated=0, available=0, packages=[])
     for item in StockItem.objects.filter(part=part).iterator():
         qty = max(0, float(item.quantity))
         totals['physical'] += qty
@@ -35,6 +36,11 @@ def _available_stock(part, excluded):
         allocated = min(qty, max(0, float(allocated or 0)))
         totals['allocated'] += allocated
         totals['available'] += qty - allocated
+        packaging = str(item.packaging or '').lower().replace('-', ' ')
+        if not packaging and item.supplier_part_id:
+            packaging = str(getattr(item.supplier_part, 'packaging', '') or '').lower()
+        if any(x in packaging for x in ('reel', 'spool', 'tape')):
+            totals['packages'].append(qty - allocated)
     return totals
 
 
@@ -86,7 +92,7 @@ def _price(part, usd_rate):
 def _snapshot(root, usd_rate, excluded, overrides):
     """Load reachable BOM graph and inventory once per analysis request."""
     bom, stock, prices, labels, warnings = {}, {}, {}, {}, []
-    inventory = {}
+    inventory, policies, incoming = {}, {}, {}
     visited = set()
     queue = [root]
     while queue and len(visited) < 10000:
@@ -100,6 +106,19 @@ def _snapshot(root, usd_rate, excluded, overrides):
         quote = (overrides[part.pk], 'Manual CAD override') if part.pk in overrides else _price(part, usd_rate)
         if quote:
             prices[part.pk] = quote
+        params = {}
+        for param in part.parameters.all():
+            params[str(param.template.name).casefold()] = str(getattr(param, 'data', '') or getattr(param, 'value', '') or '')
+        footprint = params.get('case/package') or params.get('case package') or params.get('footprint') or params.get('package') or ''
+        passive = is_basic_passive_identity(part.name, part.description, part.category)
+        hand = params.get('hand placement', '').lower() in ('yes', 'true', '1', 'y')
+        spill, rule = spillage_per_project(footprint, quote[0] if quote else 0, passive_hint=passive)
+        # Apply electronic component allowance only, not mechanical or PCB services.
+        identity = (part.name + ' ' + str(part.category or '')).lower()
+        electronic = not any(x in identity for x in ('mechanical', '-mech', '-bare', '-asm')) and not part.assembly
+        policies[part.pk] = {'spill': float(spill) if electronic else 0, 'single_package': electronic and passive and not hand and normalize_footprint(footprint) in PASSIVE_FOOTPRINT_SPILLAGE}
+        from order.models import PurchaseOrderLineItem
+        incoming[part.pk] = sum(max(0, float(line.quantity) - float(line.received or 0)) * float(line.part.pack_quantity or 1) for line in PurchaseOrderLineItem.objects.filter(part__part=part, order__status=20).select_related('part'))
         bom[part.pk] = []
         for line in BomItem.objects.filter(part=part).select_related('sub_part'):
             child = line.sub_part
@@ -116,7 +135,7 @@ def _snapshot(root, usd_rate, excluded, overrides):
             warnings.append(f'Assembly {part.name} (ID {part.pk}) has no BOM; treated as purchasable')
     if queue:
         warnings.append('10,000-part traversal limit reached')
-    return bom, stock, prices, labels, warnings, inventory
+    return bom, stock, prices, labels, warnings, inventory, policies, incoming
 
 
 class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePlugin):
@@ -124,7 +143,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.1.6'
+    VERSION = '0.2.0'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -142,7 +161,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             'title': 'Production Cost Optimizer',
             'description': 'Recursive BOM purchasing scenarios',
             'icon': 'ti:calculator:outline',
-            'source': self.plugin_static_file('optimizer_v015.js:renderOptimizer'),
+            'source': self.plugin_static_file('optimizer_v020.js:renderOptimizer'),
             'context': {'part_id': part.pk, 'part_name': part.name, 'part_ipn': part.IPN or '', 'locations': _locations()},
         }]
 
@@ -177,14 +196,15 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                 if expanded == excluded:
                     break
                 excluded = expanded
-        bom, stock, prices, labels, warnings, inventory = _snapshot(root, usd_rate, excluded, overrides)
+        bom, stock, prices, labels, warnings, inventory, policies, incoming = _snapshot(root, usd_rate, excluded, overrides)
         names = [x['name'].upper() + ' ' + x['ipn'].upper() for x in labels.values()]
         for suffix, label in [('-BARE', 'PCB fabrication'), ('-ASM', 'PCB assembly')]:
             if not any(suffix in name for name in names):
                 warnings.append(f'{label} costs excluded: no {suffix} parts in BOM')
         if any('MECH' in labels[k]['name'].upper() and not bom[k] and k not in prices for k in labels):
             warnings.append('Mechanical costs excluded: unpriced mechanical assembly without BOM')
-        scenarios = [plan(root.pk, qty, bom, stock, prices)
+        settings = {'spillage': bool(data.get('spillage', True)), 'single_package': bool(data.get('single_package', True)), 'include_incoming': bool(data.get('include_incoming', False))}
+        scenarios = [plan(root.pk, qty, bom, stock, prices, policies, {k: v['packages'] for k,v in inventory.items()}, incoming if settings['include_incoming'] else {}, settings['spillage'], settings['single_package'])
                      for qty in range(minimum, maximum + 1)]
         # Incremental spend and marginal increase; incomplete prices remain marked.
         previous = None
@@ -197,11 +217,10 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             scenario['warnings'].extend(warnings)
             for line in scenario['purchase_lines']:
                 line['part'] = labels.get(line['part_id'], {'pk': line['part_id']})
-                line.update(inventory[line['part_id']])
-                line['required'] = line['shortage'] + scenario['stock_consumed'].get(line['part_id'], 0)
+                line.update({k:v for k,v in inventory[line['part_id']].items() if k != 'packages'})
             previous = scenario
         self._last_result = {'part': labels[root.pk], 'currency': 'CAD', 'usd_rate': usd_rate,
-                             'scenarios': scenarios, 'read_only': True, 'excluded_locations': sorted(excluded), 'exclude_children': data.get('exclude_children', True), 'overrides': overrides,
+                             'scenarios': scenarios, 'read_only': True, 'excluded_locations': sorted(excluded), 'exclude_children': data.get('exclude_children', True), 'overrides': overrides, 'settings': settings,
                              'limitations': [
                                  'Estimation only: all stock statuses assumed usable; existing allocations deducted; selected locations excluded',
                                  'Optional BOM lines and substitutes are not automatically selected',
