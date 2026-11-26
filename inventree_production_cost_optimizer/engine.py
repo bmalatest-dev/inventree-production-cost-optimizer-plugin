@@ -122,11 +122,11 @@ def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incom
     known = Decimal(0)
     missing = []
     for part_id, required in sorted(purchased.items(), key=lambda p: str(p[0])):
-        if required <= 0:
+        if required <= 0 and not po_used.get(part_id, 0):
             continue
         quote = prices.get(part_id)
         unit = dec(quote[0]) if quote is not None else None
-        total = required * unit if unit is not None else None
+        total = Decimal(0) if required == 0 else (required * unit if unit is not None else None)
         if total is None:
             missing.append(part_id)
         else:
