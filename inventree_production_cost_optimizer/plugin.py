@@ -113,7 +113,7 @@ def _snapshot(root, usd_rate, excluded, overrides):
             if child.pk not in visited:
                 queue.append(child)
         if not bom[part.pk] and bool(_field(part, 'assembly', False)):
-            warnings.append(f'Assembly {part.pk} has no BOM; treated as purchasable')
+            warnings.append(f'Assembly {part.name} (ID {part.pk}) has no BOM; treated as purchasable')
     if queue:
         warnings.append('10,000-part traversal limit reached')
     return bom, stock, prices, labels, warnings, inventory
@@ -124,7 +124,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.1.5'
+    VERSION = '0.1.6'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
