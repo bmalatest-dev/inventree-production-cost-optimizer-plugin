@@ -12,7 +12,7 @@ def ceil(value):
     return dec(value).to_integral_value(rounding=ROUND_CEILING)
 
 
-def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incoming=None, spillage=False, single_package=False):
+def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incoming=None, spillage=False, single_package=False, use_subassemblies=True):
     """Expand one production run, consuming shared available stock only once.
 
     bom: parent -> [{part, quantity, attrition, setup_quantity, rounding_multiple}]
@@ -32,7 +32,8 @@ def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incom
     # Topological order ensures a shared subassembly reached by different
     # branches/depths is allocated once, after all parent demands are combined.
     graph = {}
-    incoming = defaultdict(int)
+    dependencies = defaultdict(int)
+    subassemblies = []
     seen = {root}
     pending = [root]
     while pending and len(seen) <= 10000:
@@ -41,13 +42,13 @@ def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incom
         graph[parent] = children
         for line in children:
             child = line["part"]
-            incoming[child] += 1
+            dependencies[child] += 1
             if child not in seen:
                 seen.add(child)
                 pending.append(child)
     if pending:
         warnings.append("BOM exceeds 10,000 distinct parts")
-    if incoming[root]:
+    if dependencies[root]:
         warnings.append("Circular BOM reference detected")
     queue = deque([root])
     processed = set()
@@ -81,12 +82,16 @@ def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incom
             build = required  # Target is newly manufactured units.
         else:
             used = min(required, max(Decimal(0), available.get(part_id, Decimal(0))))
+            if not leaf and not use_subassemblies:
+                used = Decimal(0)
             available[part_id] = available.get(part_id, Decimal(0)) - used
             consumed[part_id] += used
             build = required - used
         lines = graph.get(part_id, [])
+        if lines and part_id != root:
+            subassemblies.append({'part_id': part_id, 'required': float(required), 'available': float(max(Decimal(0), dec(stock.get(part_id, 0)))), 'utilized': float(required - build), 'to_manufacture': float(build)})
         if build > 0 and not lines:
-            offset = min(build, dec(incoming.get(part_id, 0)))
+            offset = min(build, max(Decimal(0), dec(incoming.get(part_id, 0))))
             if single_package and policy.get('single_package'):
                 offset = Decimal(0)
             po_used[part_id] = offset
@@ -107,8 +112,8 @@ def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incom
                     nominal = ceil(nominal / multiple) * multiple
                 old_nominal, old_adjusted = projects[child].get(part_id, (Decimal(0), Decimal(0)))
                 projects[child][part_id] = (old_nominal + nominal, old_adjusted + required_child)
-            incoming[child] -= 1
-            if incoming[child] == 0:
+            dependencies[child] -= 1
+            if dependencies[child] == 0:
                 queue.append(child)
     if seen - processed:
         warnings.append("Circular BOM reference detected")
@@ -135,5 +140,5 @@ def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incom
     return {"quantity": quantity, "known_spend_cad": float(known),
             "known_spend_per_unit_cad": float(known / quantity),
             "complete": not missing and not warnings, "missing_price_part_ids": missing,
-            "warnings": warnings, "purchase_lines": rows,
+            "warnings": warnings, "purchase_lines": rows, "subassemblies": subassemblies,
             "stock_consumed": {k: float(v) for k, v in consumed.items() if v}}
