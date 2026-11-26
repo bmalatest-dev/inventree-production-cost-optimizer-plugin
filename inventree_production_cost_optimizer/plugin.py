@@ -176,7 +176,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.3.2'
+    VERSION = '0.3.3'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -194,7 +194,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             'title': 'Production Cost Optimizer',
             'description': 'Recursive BOM purchasing scenarios',
             'icon': 'ti:calculator:outline',
-            'source': self.plugin_static_file('optimizer_v030.js:renderOptimizer'),
+            'source': self.plugin_static_file('optimizer_v033.js:renderOptimizer'),
             'context': {'part_id': part.pk, 'part_name': part.name, 'part_ipn': part.IPN or '', 'locations': _locations()},
         }]
 
@@ -282,7 +282,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                 line.update({k:v for k,v in inventory[line['part_id']].items() if k != 'packages'})
             previous = scenario
         self._last_result = {'part': labels[root.pk], 'currency': 'CAD', 'usd_rate': usd_rate,
-                             'scenarios': scenarios, 'read_only': True, 'excluded_locations': sorted(excluded), 'exclude_children': data.get('exclude_children', True), 'overrides': overrides, 'settings': settings, 'nre_candidates': candidates,
+                             'scenarios': scenarios, 'read_only': True, 'excluded_locations': sorted(excluded), 'exclude_children': data.get('exclude_children', True), 'overrides': overrides, 'settings': settings, 'nre_candidates': candidates, 'part_labels': labels,
                              'limitations': [
                                  'Estimation only: all stock statuses assumed usable; existing allocations deducted; selected locations excluded',
                                  'Optional BOM lines and substitutes are not automatically selected',
