@@ -12,7 +12,7 @@ def ceil(value):
     return dec(value).to_integral_value(rounding=ROUND_CEILING)
 
 
-def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incoming=None, spillage=False, single_package=False, use_subassemblies=True):
+def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incoming=None, spillage=False, single_package=False, use_subassemblies=True, mixed=()):
     """Expand one production run, consuming shared available stock only once.
 
     bom: parent -> [{part, quantity, attrition, setup_quantity, rounding_multiple}]
@@ -25,6 +25,8 @@ def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incom
     if quantity <= 0:
         raise ValueError("Build quantity must be positive")
     available = {key: dec(value) for key, value in stock.items()}
+    order_stock = {key: dec(value) for key, value in incoming.items()}
+    package_stock = {key: [dec(q) for q in values if q > 0] for key, values in packages.items()}
     demand = defaultdict(Decimal, {root: dec(quantity)})
     purchased = defaultdict(Decimal)
     consumed = defaultdict(Decimal)
@@ -58,44 +60,55 @@ def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incom
             warnings.append(f"Circular BOM reference detected at {part_id}")
             continue
         processed.add(part_id)
-        required = demand[part_id]
-        leaf = not graph.get(part_id)
-        policy = policies.get(part_id, {})
-        if leaf and part_id != root and required > 0:
-            needs = []
-            for nominal, adjusted in projects[part_id].values():
-                needs.append(max(adjusted, nominal + dec(policy.get('spill', 0))) if spillage else adjusted)
-            required = sum(needs, Decimal(0))
-            requirements[part_id] = required
-            if single_package and policy.get('single_package'):
-                pool = [dec(q) for q in packages.get(part_id, []) if q > 0]
-                covered = Decimal(0)
-                for need in sorted(needs, reverse=True):
-                    candidates = [i for i, q in enumerate(pool) if q >= need]
-                    if candidates:
-                        i = min(candidates, key=lambda i: pool[i])
-                        pool[i] -= need
-                        covered += need
-                available[part_id] = covered
-            usable[part_id] = max(Decimal(0), available.get(part_id, Decimal(0)))
-        if part_id == root:
-            build = required  # Target is newly manufactured units.
-        else:
-            used = min(required, max(Decimal(0), available.get(part_id, Decimal(0))))
-            if not leaf and not use_subassemblies:
-                used = Decimal(0)
-            available[part_id] = available.get(part_id, Decimal(0)) - used
-            consumed[part_id] += used
-            build = required - used
         lines = graph.get(part_id, [])
+        scopes = [part_id, (part_id, True)] if part_id in mixed else [part_id]
+        required_total = build = Decimal(0)
+        for scope in scopes:
+            required = demand[scope]
+            if required <= 0:
+                continue
+            if part_id == root:
+                build = required  # Target is newly manufactured units.
+                if not lines:
+                    offset = _take_stock(order_stock, [scope], build)
+                    po_used[scope] = offset
+                    purchased[scope] += build - offset
+                continue
+            policy = policies.get(scope, {})
+            pools = [part_id] if scope == part_id else [scope, part_id]
+            stock_available = sum(max(Decimal(0), available.get(key, Decimal(0))) for key in pools)
+            package_only = not lines and single_package and policy.get('single_package')
+            if not lines:
+                needs = [
+                    max(adjusted, nominal + dec(policy.get('spill', 0))) if spillage else adjusted
+                    for nominal, adjusted in projects[scope].values()
+                ]
+                required = sum(needs, Decimal(0))
+                if package_only:
+                    stock_available = _reserve_packages(needs, pools, package_stock, available)
+                requirements[scope] = required
+                usable[scope] = stock_available
+            used = min(required, stock_available)
+            if lines and not use_subassemblies:
+                used = Decimal(0)
+            if not package_only:
+                _take_stock(available, pools, used)
+            consumed[part_id] += used
+            shortfall = required - used
+            required_total += required
+            build += shortfall
+            if shortfall > 0 and not lines:
+                offset = Decimal(0) if package_only else _take_stock(order_stock, pools, shortfall)
+                po_used[scope] = offset
+                purchased[scope] += shortfall - offset
         if lines and part_id != root:
-            subassemblies.append({'part_id': part_id, 'required': float(required), 'available': float(max(Decimal(0), dec(stock.get(part_id, 0)))), 'utilized': float(required - build), 'to_manufacture': float(build)})
-        if build > 0 and not lines:
-            offset = min(build, max(Decimal(0), dec(incoming.get(part_id, 0))))
-            if single_package and policy.get('single_package'):
-                offset = Decimal(0)
-            po_used[part_id] = offset
-            purchased[part_id] += build - offset
+            subassemblies.append({
+                'part_id': part_id,
+                'required': float(required_total),
+                'available': float(sum(max(Decimal(0), dec(stock.get(scope, 0))) for scope in scopes)),
+                'utilized': float(required_total - build),
+                'to_manufacture': float(build),
+            })
         for line in lines:
             child = line["part"]
             if build > 0:
@@ -106,12 +119,13 @@ def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incom
                 required_child = ceil(build * per * (1 + attrition / 100) + setup)
                 if multiple > 0:
                     required_child = ceil(required_child / multiple) * multiple
-                demand[child] += required_child
+                scope = (child, True) if child in mixed and line.get("allow_variants") else child
+                demand[scope] += required_child
                 nominal = ceil(build * per + setup)
                 if multiple > 0:
                     nominal = ceil(nominal / multiple) * multiple
-                old_nominal, old_adjusted = projects[child].get(part_id, (Decimal(0), Decimal(0)))
-                projects[child][part_id] = (old_nominal + nominal, old_adjusted + required_child)
+                old_nominal, old_adjusted = projects[scope].get(part_id, (Decimal(0), Decimal(0)))
+                projects[scope][part_id] = (old_nominal + nominal, old_adjusted + required_child)
             dependencies[child] -= 1
             if dependencies[child] == 0:
                 queue.append(child)
@@ -142,3 +156,29 @@ def plan(root, quantity, bom, stock, prices, policies=None, packages=None, incom
             "complete": not missing and not warnings, "missing_price_part_ids": missing,
             "warnings": warnings, "purchase_lines": rows, "subassemblies": subassemblies,
             "stock_consumed": {k: float(v) for k, v in consumed.items() if v}}
+
+
+def _take_stock(available, pools, quantity):
+    remaining = quantity
+    for key in pools:
+        used = min(remaining, max(Decimal(0), available.get(key, Decimal(0))))
+        available[key] = available.get(key, Decimal(0)) - used
+        remaining -= used
+    return quantity - remaining
+
+
+def _reserve_packages(needs, pools, package_stock, available):
+    covered = Decimal(0)
+    for need in sorted(needs, reverse=True):
+        candidates = [
+            (quantity, key, index)
+            for key in pools
+            for index, quantity in enumerate(package_stock.get(key, []))
+            if quantity >= need
+        ]
+        if candidates:
+            _, key, index = min(candidates, key=lambda candidate: candidate[0])
+            package_stock[key][index] -= need
+            available[key] -= need
+            covered += need
+    return covered

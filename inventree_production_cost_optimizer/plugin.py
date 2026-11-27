@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 
 from django.core.exceptions import ValidationError
 from part.models import Part, BomItem
@@ -44,12 +45,13 @@ def _available_stock(part, excluded):
     return totals
 
 
-def _price(part, usd_rate, selected=None, eligible=None):
+def _price(part, usd_rate, selected, eligible=None, scope=None, cached_variants=False):
     """Placed/completed PO, cancelled PO, supplier price, stock purchase price, internal price.
 
     USD is converted using the scenario rate; other currencies remain unpriced.
     """
     eligible = eligible or [part.pk]
+    scope = part.pk if scope is None else scope
     from order.models import PurchaseOrderLineItem
     try:
         from django.db.models import Case, When, Value, IntegerField
@@ -61,11 +63,10 @@ def _price(part, usd_rate, selected=None, eligible=None):
             price = _field(line, 'purchase_price', None)
             if price is None or float(getattr(price, 'amount', price)) <= 0:
                 continue
-            currency = str(_field(line, 'purchase_price_currency', 'CAD'))
+            currency = str(getattr(price, 'currency', _field(line, 'purchase_price_currency', '')))
             pack = float(_field(line.part, 'pack_quantity', 1) or 1)
             if currency in ('CAD', 'USD') and pack > 0:
-                if selected is not None:
-                    selected[part.pk] = order.pk
+                selected[scope] = order.pk
                 status = {20: 'Placed', 30: 'Completed', 40: 'Cancelled cost reference'}[int(order.status)]
                 return (float(getattr(price, 'amount', price)) / pack * (usd_rate if currency == 'USD' else 1), f'{line.part.part.name}: {status} PO {order.reference}: {price} {currency} / pack {pack:g}')
     except (AttributeError, ValueError, TypeError):
@@ -81,7 +82,7 @@ def _price(part, usd_rate, selected=None, eligible=None):
                 continue
             for price_break in supplier.price_breaks.all():
                 price = _field(price_break, 'price', None)
-                currency = str(_field(price_break, 'price_currency', 'CAD'))
+                currency = str(getattr(price, 'currency', _field(price_break, 'price_currency', '')))
                 if price is not None and float(getattr(price, 'amount', price)) > 0 and currency in ('CAD', 'USD'):
                     offers.append((float(getattr(price, 'amount', price)) / pack * (usd_rate if currency == 'USD' else 1), f'{supplier.part.name}: Supplier price break: {price} {currency} / pack {pack:g} (indicative)'))
         if offers:
@@ -110,21 +111,51 @@ def _price(part, usd_rate, selected=None, eligible=None):
     if total_qty > 0:
         return weighted_cost / total_qty, f'Historical stock purchase price (weighted average; {total_qty:g} priced units): {", ".join(sorted(priced_names))}'
 
-    # Native internal pricing is an indicative final fallback, not a PO.
+    # Exact-only estimates must exclude InvenTree's rolled-up variant prices.
+    fields = {
+        'purchase_cost_max': 'purchase history',
+        'supplier_price_max': 'supplier',
+        'internal_cost_max': 'internal',
+        'bom_cost_max': 'BOM',
+    }
     offers = []
     for candidate in Part.objects.filter(pk__in=eligible):
-        try:
-            price = candidate.pricing.internal_cost_min
-            if price is not None:
-                currency = str(getattr(price, 'currency', ''))
-                amount = float(getattr(price, 'amount', price))
-                if currency in ('CAD', 'USD') and math.isfinite(amount) and amount > 0:
-                    offers.append((amount * (usd_rate if currency == 'USD' else 1), f'{candidate.name}: InvenTree internal pricing (minimum; indicative)'))
-        except (AttributeError, TypeError, ValueError, OverflowError):
+        pricing = candidate.pricing
+        sources = dict(fields)
+        if cached_variants and candidate.pk == part.pk:
+            sources['variant_cost_max'] = 'variant range'
+        override = _native_quote(candidate, pricing, 'override_max', 'override', usd_rate)
+        if override:
+            offers.append(override)
             continue
-    if offers:
-        return min(offers)
+        for field, source in sources.items():
+            quote = _native_quote(candidate, pricing, field, source, usd_rate)
+            if quote:
+                offers.append(quote)
+    return max(offers, default=None)
+
+
+def _native_quote(candidate, pricing, field, source, usd_rate):
+    price = getattr(pricing, field, None)
+    if price is None:
+        return None
+    try:
+        currency = str(getattr(price, 'currency', ''))
+        amount = float(getattr(price, 'amount', price))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if currency in ('CAD', 'USD') and math.isfinite(amount) and amount > 0:
+        return (amount * (usd_rate if currency == 'USD' else 1),
+                f'{candidate.name}: InvenTree {source} maximum ({price}; indicative)')
     return None
+
+
+def _incoming_stock(part):
+    from order.models import PurchaseOrderLineItem
+    return sum(
+        max(0, float(line.quantity) - float(line.received or 0)) * float(line.part.pack_quantity or 1)
+        for line in PurchaseOrderLineItem.objects.filter(part__part=part, order__status=20).select_related('part')
+    )
 
 
 def _snapshot(root, usd_rate, excluded, overrides):
@@ -157,8 +188,7 @@ def _snapshot(root, usd_rate, excluded, overrides):
         identity = (part.name + ' ' + str(part.category or '')).lower()
         electronic = not any(x in identity for x in ('mechanical', '-mech', '-bare', '-asm')) and not part.assembly
         policies[part.pk] = {'spill': float(spill) if electronic else 0, 'single_package': electronic and passive and not hand and normalize_footprint(footprint) in PASSIVE_FOOTPRINT_SPILLAGE}
-        from order.models import PurchaseOrderLineItem
-        incoming[part.pk] = sum(max(0, float(line.quantity) - float(line.received or 0)) * float(line.part.pack_quantity or 1) for line in PurchaseOrderLineItem.objects.filter(part__part=part, order__status=20).select_related('part'))
+        incoming[part.pk] = _incoming_stock(part)
         bom[part.pk] = []
         for line in BomItem.objects.filter(part=part).select_related('sub_part'):
             child = line.sub_part
@@ -178,30 +208,35 @@ def _snapshot(root, usd_rate, excluded, overrides):
         warnings.append('10,000-part traversal limit reached')
     # Reserve explicitly referenced parts for their own demand. Assign each
     # remaining variant inventory pool to at most one BOM part.
-    from collections import defaultdict
     flags = defaultdict(set)
     for lines in bom.values():
         for line in lines:
             if not line['optional']:
                 flags[line['part']].add(line['allow_variants'])
-    claimed = set(bom)
-    for part_id in sorted(flags):
-        if True not in flags[part_id]:
-            continue
-        if False in flags[part_id]:
-            warnings.append(f"Mixed variant permissions for {labels[part_id]['name']}; exact part only (conservative)")
+    claimed = set(flags) | {root.pk}
+    mixed = set()
+    for part_id, permissions in sorted(flags.items()):
+        if True not in permissions:
             continue
         part = Part.objects.get(pk=part_id)
-        variants = list(part.get_descendants(include_self=False).filter(active=True).order_by('pk'))
+        descendants = list(part.get_descendants(include_self=False).order_by('pk'))
+        variants = [variant for variant in descendants if variant.active]
         if not variants:
             continue
-        eligible = [part_id] + [v.pk for v in variants]
-        selected.pop(part_id, None)
-        quote = _price(part, usd_rate, selected, eligible)
+        scope = part_id
+        if False in permissions:
+            mixed.add(part_id)
+            scope = (part_id, True)
+            inventory[scope] = dict(physical=0, excluded=0, allocated=0, available=0, packages=[])
+            incoming[scope] = 0
+            policies[scope] = policies[part_id].copy()
+        eligible = [part_id] + [variant.pk for variant in variants]
+        selected.pop(scope, None)
+        quote = _price(part, usd_rate, selected, eligible, scope, len(variants) == len(descendants))
         if part_id in overrides:
             quote = (overrides[part_id], 'Manual CAD override')
         if quote:
-            prices[part_id] = quote
+            prices[scope] = quote
         for variant in variants:
             if variant.pk in claimed:
                 warnings.append(f"Variant {variant.name} reserved for another BOM requirement; not pooled into {part.name}")
@@ -209,18 +244,22 @@ def _snapshot(root, usd_rate, excluded, overrides):
             claimed.add(variant.pk)
             totals = _available_stock(variant, excluded)
             for key in ('physical', 'excluded', 'allocated', 'available'):
-                inventory[part_id][key] += totals[key]
-            inventory[part_id]['packages'].extend(totals['packages'])
-            incoming[part_id] += sum(max(0, float(line.quantity) - float(line.received or 0)) * float(line.part.pack_quantity or 1) for line in PurchaseOrderLineItem.objects.filter(part__part=variant, order__status=20).select_related('part'))
-        stock[part_id] = inventory[part_id]['available']
+                inventory[scope][key] += totals[key]
+            inventory[scope]['packages'].extend(totals['packages'])
+            incoming[scope] += _incoming_stock(variant)
+        stock[scope] = inventory[scope]['available']
         # Recalculate price-sensitive spillage using the resolved variant quote.
         params = {str(p.template.name).casefold(): str(getattr(p, 'data', '') or getattr(p, 'value', '') or '') for p in part.parameters.all()}
         footprint = params.get('case/package') or params.get('case package') or params.get('footprint') or params.get('package') or ''
         passive = is_basic_passive_identity(part.name, part.description, part.category)
         identity = (part.name + ' ' + str(part.category or '')).lower()
         if not part.assembly and not any(x in identity for x in ('mechanical', '-mech', '-bare', '-asm')):
-            policies[part_id]['spill'] = float(spillage_per_project(footprint, quote[0] if quote else 0, passive_hint=passive)[0])
-    return bom, stock, prices, labels, warnings, inventory, policies, incoming, selected
+            policies[scope]['spill'] = float(spillage_per_project(footprint, quote[0] if quote else 0, passive_hint=passive)[0])
+    return bom, stock, prices, labels, warnings, inventory, policies, incoming, selected, mixed
+
+
+def _part_id(scope):
+    return scope[0] if isinstance(scope, tuple) else scope
 
 
 def _manufacturing(part):
@@ -229,14 +268,14 @@ def _manufacturing(part):
 
 def _nre_candidates(selected, labels, usd_rate):
     from order.models import PurchaseOrderLineItem, PurchaseOrder
-    from collections import defaultdict
     groups = defaultdict(list)
-    for part_id, order_id in selected.items():
-        label = labels[part_id]
+    for scope, order_id in selected.items():
+        label = labels[_part_id(scope)]
         if any(str(label[k]).upper().endswith(('-BARE', '-ASM')) for k in ('name', 'ipn')):
-            groups[order_id].append(part_id)
+            groups[order_id].append(scope)
     rows = []
-    for order_id, parts in groups.items():
+    for order_id, scopes in groups.items():
+        parts = sorted({_part_id(scope) for scope in scopes})
         order = PurchaseOrder.objects.get(pk=order_id)
         for line in PurchaseOrderLineItem.objects.filter(order_id=order_id).select_related('part__part'):
             if line.part_id and _manufacturing(line.part.part):
@@ -244,12 +283,12 @@ def _nre_candidates(selected, labels, usd_rate):
             price = line.purchase_price
             currency = str(getattr(line, 'purchase_price_currency', ''))
             cost = float(getattr(price, 'amount', price)) * float(line.quantity) * (usd_rate if currency == 'USD' else 1) if price is not None and currency in ('CAD', 'USD') else None
-            rows.append(dict(id='line:' + str(line.pk), order_id=order_id, po=order.reference, description=str(line.part.part.name if line.part_id else getattr(line, 'reference', 'Additional line')), part_ids=parts, cost=cost))
+            rows.append(dict(id='line:' + str(line.pk), order_id=order_id, po=order.reference, description=str(line.part.part.name if line.part_id else getattr(line, 'reference', 'Additional line')), part_ids=parts, cost=cost, scopes=scopes))
         for line in order.extra_lines.all():
             price = line.price
             currency = str(getattr(line, 'price_currency', ''))
             cost = float(getattr(price, 'amount', price)) * float(line.quantity) * (usd_rate if currency == 'USD' else 1) if price is not None and currency in ('CAD', 'USD') else None
-            rows.append(dict(id='extra:' + str(line.pk), order_id=order_id, po=order.reference, description=str(getattr(line, 'description', '') or getattr(line, 'reference', '') or 'Extra charge'), part_ids=parts, cost=cost))
+            rows.append(dict(id='extra:' + str(line.pk), order_id=order_id, po=order.reference, description=str(getattr(line, 'description', '') or getattr(line, 'reference', '') or 'Extra charge'), part_ids=parts, cost=cost, scopes=scopes))
     return rows
 
 
@@ -258,7 +297,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.3.5'
+    VERSION = '0.3.6'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -311,7 +350,8 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                 if expanded == excluded:
                     break
                 excluded = expanded
-        bom, stock, prices, labels, warnings, inventory, policies, incoming, selected = _snapshot(root, usd_rate, excluded, overrides)
+        bom, stock, prices, labels, warnings, inventory, policies, incoming, selected, mixed = _snapshot(root, usd_rate, excluded, overrides)
+        variant_enabled = {line['part'] for lines in bom.values() for line in lines if line['allow_variants'] and not line['optional']}
         names = [x['name'].upper() + ' ' + x['ipn'].upper() for x in labels.values()]
         for suffix, label in [('-BARE', 'PCB fabrication'), ('-ASM', 'PCB assembly')]:
             if not any(suffix in name for name in names):
@@ -319,7 +359,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
         if any('MECH' in labels[k]['name'].upper() and not bom[k] and k not in prices for k in labels):
             warnings.append('Mechanical costs excluded: unpriced mechanical assembly without BOM')
         settings = {'spillage': bool(data.get('spillage', True)), 'single_package': bool(data.get('single_package', True)), 'include_incoming': bool(data.get('include_incoming', False)), 'use_subassemblies': bool(data.get('use_subassemblies', True)), 'include_nre': bool(data.get('include_nre', True))}
-        scenarios = [plan(root.pk, qty, bom, stock, prices, policies, {k: v['packages'] for k,v in inventory.items()}, incoming if settings['include_incoming'] else {}, settings['spillage'], settings['single_package'], settings['use_subassemblies'])
+        scenarios = [plan(root.pk, qty, bom, stock, prices, policies, {k: v['packages'] for k,v in inventory.items()}, incoming if settings['include_incoming'] else {}, settings['spillage'], settings['single_package'], settings['use_subassemblies'], mixed=mixed)
                      for qty in range(minimum, maximum + 1)]
         candidates = _nre_candidates(selected, labels, usd_rate)
         try:
@@ -343,8 +383,14 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
         previous = None
         for scenario in scenarios:
             shortages = {p['part_id'] for p in scenario['purchase_lines'] if p['shortage'] > 0}
+            shortage_parts = {_part_id(scope) for scope in shortages}
             scenario['recurring_spend_cad'] = scenario['known_spend_cad']
-            scenario['nre_lines'] = [r for r in candidates if settings['include_nre'] and r['included'] and shortages.intersection(r['part_ids'])]
+            scenario['nre_lines'] = [
+                row for row in candidates
+                if settings['include_nre'] and row['included']
+                and (shortages.intersection(row['scopes']) if 'scopes' in row
+                     else shortage_parts.intersection(row['part_ids']))
+            ]
             scenario['nre_spend_cad'] = sum(r['cost'] for r in scenario['nre_lines'] if r['cost'] is not None)
             if any(r['cost'] is None for r in scenario['nre_lines']):
                 scenario['complete'] = False
@@ -359,10 +405,27 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
             scenario['warnings'].extend(warnings)
             for line in scenario['subassemblies']:
                 line['part'] = labels[line['part_id']]
+            scenario['missing_price_part_ids'] = sorted({_part_id(scope) for scope in scenario['missing_price_part_ids']})
             for line in scenario['purchase_lines']:
-                line['part'] = labels.get(line['part_id'], {'pk': line['part_id']})
-                line.update({k:v for k,v in inventory[line['part_id']].items() if k != 'packages'})
+                scope = line['part_id']
+                part_id = _part_id(scope)
+                line['part_id'] = part_id
+                line['part'] = labels[part_id]
+                line.update({key: value for key, value in inventory[scope].items() if key != 'packages'})
+                if part_id in mixed:
+                    demand_type = 'Variant-eligible' if scope != part_id else 'Exact only'
+                    line['source'] = f"{demand_type}: {line['source']}"
+                if line['shortage'] > 0 and line['unit_cost_cad'] is None:
+                    part_name = line['part']['ipn'] or line['part']['name']
+                    allows_variants = scope != part_id or (part_id not in mixed and part_id in variant_enabled)
+                    eligibility = 'exact part and eligible active variants' if allows_variants else 'exact part only'
+                    scenario['warnings'].append(
+                        f'{part_name} (ID {part_id}): no positive CAD/USD price for {eligibility} '
+                        'in purchase orders, supplier pricing, stock purchase prices, or InvenTree pricing'
+                    )
             previous = scenario
+        for row in candidates:
+            row.pop('scopes', None)
         self._last_result = {'part': labels[root.pk], 'currency': 'CAD', 'usd_rate': usd_rate,
                              'scenarios': scenarios, 'read_only': True, 'excluded_locations': sorted(excluded), 'exclude_children': data.get('exclude_children', True), 'overrides': overrides, 'settings': settings, 'nre_candidates': candidates, 'part_labels': labels,
                              'limitations': [

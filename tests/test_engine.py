@@ -36,6 +36,35 @@ class PlannerTests(unittest.TestCase):
                                     'setup_quantity': 1, 'rounding_multiple': 5}]}, {}, {2: (1, 'test')})
         self.assertEqual(result['purchase_lines'][0]['shortage'], 25)
 
+    def test_mixed_variant_demand_reserves_exact_stock_and_incoming(self):
+        flexible = (3, True)
+        bom = {1: [{'part': 3, 'quantity': 4}, {'part': 3, 'quantity': 8, 'allow_variants': True}]}
+        result = plan(1, 1, bom, {3: 5, flexible: 2},
+                      {3: (9, 'Exact'), flexible: (2, 'Variant')},
+                      incoming={3: 2, flexible: 1}, mixed={3})
+        rows = {row['part_id']: row for row in result['purchase_lines']}
+        self.assertNotIn(3, rows)
+        self.assertEqual(rows[flexible]['usable'], 3)
+        self.assertEqual(rows[flexible]['incoming_used'], 3)
+        self.assertEqual(rows[flexible]['shortage'], 2)
+        self.assertEqual(result['known_spend_cad'], 4)
+
+    def test_mixed_variant_stock_cannot_cover_exact_only_shortage(self):
+        flexible = (3, True)
+        bom = {1: [{'part': 3, 'quantity': 4}, {'part': 3, 'quantity': 2, 'allow_variants': True}]}
+        result = plan(1, 1, bom, {3: 1, flexible: 10}, {flexible: (2, 'Variant')},
+                      incoming={3: 1, flexible: 10}, mixed={3})
+        self.assertEqual(result['missing_price_part_ids'], [3])
+        self.assertEqual(result['purchase_lines'][0]['shortage'], 2)
+
+    def test_mixed_variant_demand_cannot_reuse_exact_package_units(self):
+        flexible = (3, True)
+        bom = {1: [{'part': 3, 'quantity': 4}, {'part': 3, 'quantity': 3, 'allow_variants': True}]}
+        result = plan(1, 1, bom, {3: 6, flexible: 1}, {flexible: (2, 'Variant')},
+                      policies={3: {'single_package': True}, flexible: {'single_package': True}},
+                      packages={3: [6], flexible: [1]}, single_package=True, mixed={3})
+        self.assertEqual(result['purchase_lines'][0]['shortage'], 3)
+
     def test_cycle_is_warning(self):
         result = plan(1, 2, {1: [{'part': 2}], 2: [{'part': 1}]}, {}, {})
         self.assertFalse(result['complete'])
