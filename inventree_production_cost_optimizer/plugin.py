@@ -45,7 +45,7 @@ def _available_stock(part, excluded):
 
 
 def _price(part, usd_rate, selected=None):
-    """Placed/completed PO, cancelled PO, then supplier price fallback.
+    """Placed/completed PO, cancelled PO, supplier price, stock purchase price, internal price.
 
     USD is converted using the scenario rate; other currencies remain unpriced.
     """
@@ -86,6 +86,36 @@ def _price(part, usd_rate, selected=None):
         if offers:
             return min(offers)
     except (AttributeError, TypeError, ValueError):
+        pass
+    # Legacy stock can carry a unit purchase price without a linked PO.
+    from stock.models import StockItem
+    weighted_cost = total_qty = 0.0
+    for item in StockItem.objects.filter(part=part, quantity__gt=0).iterator():
+        price = item.purchase_price
+        if price is None:
+            continue
+        try:
+            currency = str(getattr(price, 'currency', getattr(item, 'purchase_price_currency', '')))
+            amount = float(getattr(price, 'amount', price))
+            qty = float(item.quantity)
+            if currency not in ('CAD', 'USD') or not math.isfinite(amount) or amount <= 0 or not math.isfinite(qty) or qty <= 0:
+                continue
+            weighted_cost += amount * qty * (usd_rate if currency == 'USD' else 1)
+            total_qty += qty
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            continue
+    if total_qty > 0:
+        return weighted_cost / total_qty, f'Historical stock purchase price (weighted average; {total_qty:g} priced units)'
+
+    # Native internal pricing is an indicative final fallback, not a PO.
+    try:
+        price = part.pricing.internal_cost_min
+        if price is not None:
+            currency = str(getattr(price, 'currency', ''))
+            amount = float(getattr(price, 'amount', price))
+            if currency in ('CAD', 'USD') and math.isfinite(amount) and amount > 0:
+                return amount * (usd_rate if currency == 'USD' else 1), 'InvenTree internal pricing (minimum; indicative)'
+    except (AttributeError, TypeError, ValueError, OverflowError):
         pass
     return None
 
@@ -176,7 +206,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.3.3'
+    VERSION = '0.3.4'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
