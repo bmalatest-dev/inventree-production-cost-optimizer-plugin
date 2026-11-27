@@ -44,16 +44,17 @@ def _available_stock(part, excluded):
     return totals
 
 
-def _price(part, usd_rate, selected=None):
+def _price(part, usd_rate, selected=None, eligible=None):
     """Placed/completed PO, cancelled PO, supplier price, stock purchase price, internal price.
 
     USD is converted using the scenario rate; other currencies remain unpriced.
     """
+    eligible = eligible or [part.pk]
     from order.models import PurchaseOrderLineItem
     try:
         from django.db.models import Case, When, Value, IntegerField
-        lines = PurchaseOrderLineItem.objects.filter(part__part=part, order__status__in=[20, 30, 40]).select_related(
-            'order', 'part'
+        lines = PurchaseOrderLineItem.objects.filter(part__part_id__in=eligible, order__status__in=[20, 30, 40]).select_related(
+            'order', 'part__part'
         ).annotate(priority=Case(When(order__status=40, then=Value(1)), default=Value(0), output_field=IntegerField())).order_by('priority', '-order__creation_date', '-pk')
         for line in lines:
             order = line.order
@@ -66,13 +67,13 @@ def _price(part, usd_rate, selected=None):
                 if selected is not None:
                     selected[part.pk] = order.pk
                 status = {20: 'Placed', 30: 'Completed', 40: 'Cancelled cost reference'}[int(order.status)]
-                return (float(getattr(price, 'amount', price)) / pack * (usd_rate if currency == 'USD' else 1), f'{status} PO {order.reference}: {price} {currency} / pack {pack:g}')
+                return (float(getattr(price, 'amount', price)) / pack * (usd_rate if currency == 'USD' else 1), f'{line.part.part.name}: {status} PO {order.reference}: {price} {currency} / pack {pack:g}')
     except (AttributeError, ValueError, TypeError):
         pass
 
     try:
         from company.models import SupplierPart
-        suppliers = SupplierPart.objects.filter(part=part).prefetch_related('price_breaks')
+        suppliers = SupplierPart.objects.filter(part_id__in=eligible).select_related('part').prefetch_related('price_breaks')
         offers = []
         for supplier in suppliers:
             pack = float(_field(supplier, 'pack_quantity', 1) or 1)
@@ -82,7 +83,7 @@ def _price(part, usd_rate, selected=None):
                 price = _field(price_break, 'price', None)
                 currency = str(_field(price_break, 'price_currency', 'CAD'))
                 if price is not None and float(getattr(price, 'amount', price)) > 0 and currency in ('CAD', 'USD'):
-                    offers.append((float(getattr(price, 'amount', price)) / pack * (usd_rate if currency == 'USD' else 1), f'Supplier price break: {price} {currency} / pack {pack:g} (indicative)'))
+                    offers.append((float(getattr(price, 'amount', price)) / pack * (usd_rate if currency == 'USD' else 1), f'{supplier.part.name}: Supplier price break: {price} {currency} / pack {pack:g} (indicative)'))
         if offers:
             return min(offers)
     except (AttributeError, TypeError, ValueError):
@@ -90,7 +91,8 @@ def _price(part, usd_rate, selected=None):
     # Legacy stock can carry a unit purchase price without a linked PO.
     from stock.models import StockItem
     weighted_cost = total_qty = 0.0
-    for item in StockItem.objects.filter(part=part, quantity__gt=0).iterator():
+    priced_names = set()
+    for item in StockItem.objects.filter(part_id__in=eligible, quantity__gt=0).select_related('part').iterator():
         price = item.purchase_price
         if price is None:
             continue
@@ -102,21 +104,26 @@ def _price(part, usd_rate, selected=None):
                 continue
             weighted_cost += amount * qty * (usd_rate if currency == 'USD' else 1)
             total_qty += qty
+            priced_names.add(item.part.name)
         except (AttributeError, TypeError, ValueError, OverflowError):
             continue
     if total_qty > 0:
-        return weighted_cost / total_qty, f'Historical stock purchase price (weighted average; {total_qty:g} priced units)'
+        return weighted_cost / total_qty, f'Historical stock purchase price (weighted average; {total_qty:g} priced units): {", ".join(sorted(priced_names))}'
 
     # Native internal pricing is an indicative final fallback, not a PO.
-    try:
-        price = part.pricing.internal_cost_min
-        if price is not None:
-            currency = str(getattr(price, 'currency', ''))
-            amount = float(getattr(price, 'amount', price))
-            if currency in ('CAD', 'USD') and math.isfinite(amount) and amount > 0:
-                return amount * (usd_rate if currency == 'USD' else 1), 'InvenTree internal pricing (minimum; indicative)'
-    except (AttributeError, TypeError, ValueError, OverflowError):
-        pass
+    offers = []
+    for candidate in Part.objects.filter(pk__in=eligible):
+        try:
+            price = candidate.pricing.internal_cost_min
+            if price is not None:
+                currency = str(getattr(price, 'currency', ''))
+                amount = float(getattr(price, 'amount', price))
+                if currency in ('CAD', 'USD') and math.isfinite(amount) and amount > 0:
+                    offers.append((amount * (usd_rate if currency == 'USD' else 1), f'{candidate.name}: InvenTree internal pricing (minimum; indicative)'))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            continue
+    if offers:
+        return min(offers)
     return None
 
 
@@ -161,6 +168,7 @@ def _snapshot(root, usd_rate, excluded, overrides):
                 'setup_quantity': float(_field(line, 'setup_quantity', 0) or 0),
                 'rounding_multiple': float(_field(line, 'rounding_multiple', 0) or 0),
                 'optional': bool(_field(line, 'optional', False)),
+                'allow_variants': bool(_field(line, 'allow_variants', False)),
             })
             if child.pk not in visited:
                 queue.append(child)
@@ -168,6 +176,50 @@ def _snapshot(root, usd_rate, excluded, overrides):
             warnings.append(f'Assembly {part.name} (ID {part.pk}) has no BOM; treated as purchasable')
     if queue:
         warnings.append('10,000-part traversal limit reached')
+    # Reserve explicitly referenced parts for their own demand. Assign each
+    # remaining variant inventory pool to at most one BOM part.
+    from collections import defaultdict
+    flags = defaultdict(set)
+    for lines in bom.values():
+        for line in lines:
+            if not line['optional']:
+                flags[line['part']].add(line['allow_variants'])
+    claimed = set(bom)
+    for part_id in sorted(flags):
+        if True not in flags[part_id]:
+            continue
+        if False in flags[part_id]:
+            warnings.append(f"Mixed variant permissions for {labels[part_id]['name']}; exact part only (conservative)")
+            continue
+        part = Part.objects.get(pk=part_id)
+        variants = list(part.get_descendants(include_self=False).filter(active=True).order_by('pk'))
+        if not variants:
+            continue
+        eligible = [part_id] + [v.pk for v in variants]
+        selected.pop(part_id, None)
+        quote = _price(part, usd_rate, selected, eligible)
+        if part_id in overrides:
+            quote = (overrides[part_id], 'Manual CAD override')
+        if quote:
+            prices[part_id] = quote
+        for variant in variants:
+            if variant.pk in claimed:
+                warnings.append(f"Variant {variant.name} reserved for another BOM requirement; not pooled into {part.name}")
+                continue
+            claimed.add(variant.pk)
+            totals = _available_stock(variant, excluded)
+            for key in ('physical', 'excluded', 'allocated', 'available'):
+                inventory[part_id][key] += totals[key]
+            inventory[part_id]['packages'].extend(totals['packages'])
+            incoming[part_id] += sum(max(0, float(line.quantity) - float(line.received or 0)) * float(line.part.pack_quantity or 1) for line in PurchaseOrderLineItem.objects.filter(part__part=variant, order__status=20).select_related('part'))
+        stock[part_id] = inventory[part_id]['available']
+        # Recalculate price-sensitive spillage using the resolved variant quote.
+        params = {str(p.template.name).casefold(): str(getattr(p, 'data', '') or getattr(p, 'value', '') or '') for p in part.parameters.all()}
+        footprint = params.get('case/package') or params.get('case package') or params.get('footprint') or params.get('package') or ''
+        passive = is_basic_passive_identity(part.name, part.description, part.category)
+        identity = (part.name + ' ' + str(part.category or '')).lower()
+        if not part.assembly and not any(x in identity for x in ('mechanical', '-mech', '-bare', '-asm')):
+            policies[part_id]['spill'] = float(spillage_per_project(footprint, quote[0] if quote else 0, passive_hint=passive)[0])
     return bom, stock, prices, labels, warnings, inventory, policies, incoming, selected
 
 
@@ -206,7 +258,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.3.4'
+    VERSION = '0.3.5'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -315,7 +367,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                              'scenarios': scenarios, 'read_only': True, 'excluded_locations': sorted(excluded), 'exclude_children': data.get('exclude_children', True), 'overrides': overrides, 'settings': settings, 'nre_candidates': candidates, 'part_labels': labels,
                              'limitations': [
                                  'Estimation only: all stock statuses assumed usable; existing allocations deducted; selected locations excluded',
-                                 'Optional BOM lines and substitutes are not automatically selected',
+                                 'Optional BOM lines and explicit substitutes are not automatically selected; overlapping variant pools are reserved conservatively',
                                  'Supplier MOQs, package multiples and currencies other than CAD/USD are not yet modeled',
                                  'Reported spend is a lower bound when pricing is incomplete',
                              ]}
