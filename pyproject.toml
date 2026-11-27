@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inventree-production-cost-optimizer"
-version = "0.3.6"
+version = "0.3.7"
 description = "Read-only recursive BOM production quantity and purchasing cost planning for InvenTree."
 readme = "README.md"
 requires-python = ">=3.11"

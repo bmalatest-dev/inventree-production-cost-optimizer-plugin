@@ -297,7 +297,7 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
     SLUG = 'production-cost-optimizer'
     TITLE = 'Production Cost Optimizer'
     DESCRIPTION = 'Read-only BOM and inventory-aware production purchasing scenarios.'
-    VERSION = '0.3.6'
+    VERSION = '0.3.7'
     AUTHOR = 'Per Vices Corporation'
     LICENSE = 'MIT'
     ACTION_NAME = 'production_cost_optimizer'
@@ -416,13 +416,9 @@ class ProductionCostOptimizerPlugin(ActionMixin, UserInterfaceMixin, InvenTreePl
                     demand_type = 'Variant-eligible' if scope != part_id else 'Exact only'
                     line['source'] = f"{demand_type}: {line['source']}"
                 if line['shortage'] > 0 and line['unit_cost_cad'] is None:
-                    part_name = line['part']['ipn'] or line['part']['name']
                     allows_variants = scope != part_id or (part_id not in mixed and part_id in variant_enabled)
-                    eligibility = 'exact part and eligible active variants' if allows_variants else 'exact part only'
-                    scenario['warnings'].append(
-                        f'{part_name} (ID {part_id}): no positive CAD/USD price for {eligibility} '
-                        'in purchase orders, supplier pricing, stock purchase prices, or InvenTree pricing'
-                    )
+                    eligibility = 'exact part and eligible variants' if allows_variants else 'exact part only'
+                    line['source'] = f'Missing price ({eligibility})'
             previous = scenario
         for row in candidates:
             row.pop('scopes', None)
